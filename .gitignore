@@ -1,0 +1,8 @@
+**wandb/*
+**.pyc
+**plots
+**__pycache__/*
+**pycache/*
+**output/*
+**ckpt/*
+**checkpoints/*
