@@ -19,18 +19,37 @@ import argparse
 import torch
 import torch.nn as nn
 import torch.distributed as dist
-from torch.utils.data import DataLoader, Dataset
-import torchvision.io as tv_io
+from torch.utils.data import DataLoader
 import numpy as np
 
-from datasets import load_dataset
+from datasets import load_dataset, Video, ClassLabel, Features
 import wandb
+import evaluate
 
-from transformers import VideoMAEImageProcessor, VideoMAEForVideoClassification
+from transformers import (
+    VideoMAEImageProcessor, 
+    VideoMAEForVideoClassification,
+    TrainingArguments,
+    Trainer
+)
 from sklearn.metrics import accuracy_score, f1_score
-
-from dataset import VideoMAEDataset, collate_batch
 from config import default_wandb_config, set_seed
+
+
+# ============================================================================
+# Collate Function
+# ============================================================================
+
+def collate_fn(examples):
+    """
+    Collate function for batching video examples.
+    Permutes video dimensions to (num_frames, num_channels, height, width).
+    """
+    pixel_values = torch.stack(
+        [example["video"].permute(1, 0, 2, 3) for example in examples]
+    )
+    labels = torch.tensor([example["label"] for example in examples])
+    return {"pixel_values": pixel_values, "labels": labels}
 
 
 # ============================================================================
@@ -54,9 +73,9 @@ def train_one_epoch(
     preds = []
     targets = []
 
-    for batch, labels in loader:
+    for batch in loader:
         pixel_values = batch["pixel_values"].to(device)
-        labels = labels.to(device)
+        labels = batch["labels"].to(device)
 
         optimizer.zero_grad()
 
@@ -97,9 +116,9 @@ def validate(
     targets = []
 
     with torch.no_grad():
-        for batch, labels in loader:
+        for batch in loader:
             pixel_values = batch["pixel_values"].to(device)
-            labels = labels.to(device)
+            labels = batch["labels"].to(device)
 
             outputs = model(pixel_values, labels=labels)
             loss = outputs.loss
@@ -132,8 +151,9 @@ def evaluate_test(
     targets = []
 
     with torch.no_grad():
-        for batch, labels in loader:
+        for batch in loader:
             pixel_values = batch["pixel_values"].to(device)
+            labels = batch["labels"]
             outputs = model(pixel_values)
             preds.append(outputs.logits.cpu())
             targets.append(labels)
@@ -144,9 +164,17 @@ def evaluate_test(
     return preds, targets
 
 
+
 # ============================================================================
 # Main
 # ============================================================================
+
+def compute_metrics(eval_pred):
+    """Compute accuracy metric for evaluation."""
+    metric = evaluate.load("accuracy")
+    predictions = np.argmax(eval_pred.predictions, axis=1)
+    return metric.compute(predictions=predictions, references=eval_pred.label_ids)
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -190,220 +218,141 @@ def main():
     # Load dataset
     if rank == 0:
         print("Loading dataset...")
-    ds = load_dataset("joaomalves/read-my-ears")
+
+    features = Features({
+        "video": Video(),
+        "label": ClassLabel(names=["background", "action"]),
+    })
+
+    ds = load_dataset(
+        "joaomalves/read-my-ears",
+        data_files={
+            "train": "train.csv",
+            "validation": "val.csv",
+            "test": "test.csv",
+        },
+        features=features,
+    )
+
+    # Cast columns to the correct types for each split in the DatasetDict
+    for split in ds.keys():
+        ds[split] = ds[split].cast_column("video", Video())
+        ds[split] = ds[split].cast_column("label", ClassLabel(names=["background", "action"]))
+
     if rank == 0:
-        print(f"Dataset splits: {ds.keys()}")
+        print(ds)
+        print(f"Train: {len(ds['train'])} samples")
+        print(f"Validation: {len(ds['validation'])} samples")
+        print(f"Test: {len(ds['test'])} samples")
 
-    # print dataset format
+    # Initialize model and image processor
+    model_ckpt = config.get("model_checkpoint", "MCG-NJU/videomae-base-finetuned-kinetics")
+    
+    label2id = {"background": 0, "action": 1}
+    id2label = {0: "background", 1: "action"}
+    
     if rank == 0:
-        print(f"Dataset format: {ds['train'].features}")
+        print(f"Loading model from {model_ckpt}...")
+    
+    image_processor = VideoMAEImageProcessor.from_pretrained(model_ckpt)
+    model = VideoMAEForVideoClassification.from_pretrained(
+        model_ckpt,
+        label2id=label2id,
+        id2label=id2label,
+        ignore_mismatched_sizes=True,
+    )
 
-    # print video files
+    # Define training arguments
+    batch_size = int(config.get("batch_size", 4))
+    num_epochs = int(config.get("epochs", 10))
+    learning_rate = float(config.get("learning_rate", 5e-5))
+    num_workers = int(config.get("num_workers", 2))
+    
+    output_dir = f"videomae-finetuned-ears-{wandb_run.id if wandb_run else 'local'}"
+    
+    training_args = TrainingArguments(
+        output_dir=output_dir,
+        remove_unused_columns=False,
+        eval_strategy="epoch",
+        save_strategy="epoch",
+        learning_rate=learning_rate,
+        per_device_train_batch_size=batch_size,
+        per_device_eval_batch_size=batch_size,
+        warmup_ratio=0.1,
+        logging_steps=10,
+        load_best_model_at_end=True,
+        metric_for_best_model="accuracy",
+        num_train_epochs=num_epochs,
+        dataloader_num_workers=num_workers,
+        report_to="wandb" if rank == 0 and wandb_run else "none",
+        save_total_limit=2,
+    )
+
+    # Initialize Trainer
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=ds["train"],
+        eval_dataset=ds["validation"],
+        processing_class=image_processor,
+        compute_metrics=compute_metrics,
+        data_collator=collate_fn,
+    )
+
+    # Train the model
     if rank == 0:
-        print("Sample video files from training set:")
-        for i in range(min(3, len(ds["train"]))):
-            item = ds["train"][i]
-            path = item.get("path") or item.get("video") or item.get("file")
-            print(f"  {i}: {path}")
+        print("Starting training...")
+    
+    train_results = trainer.train()
+    
+    if rank == 0:
+        print("Training completed!")
+        print(f"Train results: {train_results}")
 
-    # # Extract splits
-    # train_split = ds.get("train")
-    # val_split = ds.get("validation")
-    # test_split = ds.get("test")
+    # Evaluate on test set
+    if rank == 0:
+        print("\nEvaluating on test set...")
+    
+    test_results = trainer.evaluate(ds["test"])
+    
+    if rank == 0:
+        print(f"Test results: {test_results}")
+        
+        # Log test metrics to wandb
+        if wandb_run:
+            wandb.log({
+                "test/accuracy": test_results.get("eval_accuracy", 0),
+                "test/loss": test_results.get("eval_loss", 0),
+            })
 
-    # if train_split is None:
-    #     raise RuntimeError("'train' split not found in dataset")
-    # if val_split is None:
-    #     raise RuntimeError("'validation' split not found in dataset")
-    # if test_split is None:
-    #     raise RuntimeError("'test' split not found in dataset")
+    # Save the final model
+    if rank == 0:
+        final_model_path = Path(output_dir) / "final_model"
+        trainer.save_model(final_model_path)
+        print(f"\nFinal model saved to {final_model_path}")
+        
+        # Compute F1 score on test set
+        print("\nComputing F1 score on test set...")
+        test_dataloader = trainer.get_eval_dataloader(ds["test"])
+        preds, targets = evaluate_test(model, test_dataloader, device)
+        
+        test_accuracy = accuracy_score(targets, preds)
+        test_f1 = f1_score(targets, preds, average="weighted")
+        
+        print(f"Test Accuracy: {test_accuracy:.4f}")
+        print(f"Test F1 Score: {test_f1:.4f}")
+        
+        if wandb_run:
+            wandb.log({
+                "test/accuracy_final": test_accuracy,
+                "test/f1_score": test_f1,
+            })
+            wandb.finish()
 
-    # if rank == 0:
-    #     print(f"Train size: {len(train_split)}, Val size: {len(val_split)}, Test size: {len(test_split)}")
+    # Clean up distributed training
+    if world_size > 1:
+        dist.destroy_process_group()
 
-    # # Discover number of classes from training labels
-    # all_labels = set()
-    # for i in range(min(100, len(train_split))):
-    #     item = train_split[i]
-    #     if "label" in item and item["label"] is not None:
-    #         all_labels.add(int(item["label"]))
-    #     else:
-    #         # Infer from path
-    #         path = item.get("path") or item.get("video") or item.get("file")
-    #         if path is not None:
-    #             label = 1 if Path(path).name.lower().startswith("action") else 0
-    #             all_labels.add(label)
-    #         # If path is also None, skip this item (default to label 0 if truly missing)
-
-    # num_classes = max(all_labels) + 1 if all_labels else 2
-    # if rank == 0:
-    #     print(f"Number of classes: {num_classes}")
-
-    # # Load model and image processor
-    # if rank == 0:
-    #     print(f"Loading model from {config.get('model_checkpoint')}...")
-    # model_ckpt = config.get('model_checkpoint')
-    # image_processor = VideoMAEImageProcessor.from_pretrained(model_ckpt)
-
-    # # Label mappings
-    # label2id = {str(i): i for i in range(num_classes)}
-    # id2label = {i: str(i) for i in range(num_classes)}
-
-    # model = VideoMAEForVideoClassification.from_pretrained(
-    #     model_ckpt,
-    #     label2id=label2id,
-    #     id2label=id2label,
-    #     ignore_mismatched_sizes=True,
-    # )
-    # model = model.to(device)
-
-    # # Create datasets and loaders
-    # print("Creating datasets and loaders...")
-    # train_dataset = VideoMAEDataset(
-    #     train_split, image_processor, num_frames=int(config.get('num_frames', 16))
-    # )
-    # val_dataset = VideoMAEDataset(
-    #     val_split, image_processor, num_frames=int(config.get('num_frames', 16))
-    # )
-    # test_dataset = VideoMAEDataset(
-    #     test_split, image_processor, num_frames=int(config.get('num_frames', 16))
-    # )
-
-    # # Use DistributedSampler when running distributed
-    # train_sampler = None
-    # val_sampler = None
-    # test_sampler = None
-    # if world_size > 1:
-    #     from torch.utils.data.distributed import DistributedSampler
-    #     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
-    #     val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False)
-    #     test_sampler = DistributedSampler(test_dataset, num_replicas=world_size, rank=rank, shuffle=False)
-
-    # train_loader = DataLoader(
-    #     train_dataset,
-    #     batch_size=int(config.get('batch_size', 4)),
-    #     shuffle=(train_sampler is None),
-    #     num_workers=int(config.get('num_workers', 2)),
-    #     collate_fn=collate_batch,
-    #     sampler=train_sampler,
-    #     pin_memory=torch.cuda.is_available(),
-    # )
-    # val_loader = DataLoader(
-    #     val_dataset,
-    #     batch_size=int(config.get('batch_size', 4)),
-    #     shuffle=False,
-    #     num_workers=int(config.get('num_workers', 2)),
-    #     collate_fn=collate_batch,
-    #     sampler=val_sampler,
-    #     pin_memory=torch.cuda.is_available(),
-    # )
-    # test_loader = DataLoader(
-    #     test_dataset,
-    #     batch_size=int(config.get('batch_size', 4)),
-    #     shuffle=False,
-    #     num_workers=int(config.get('num_workers', 2)),
-    #     collate_fn=collate_batch,
-    #     sampler=test_sampler,
-    #     pin_memory=torch.cuda.is_available(),
-    # )
-
-    # # Optimizer
-    # optimizer = torch.optim.AdamW(model.parameters(), lr=float(config.get('learning_rate', 1e-4)))
-
-    # # Training loop
-    # checkpoint_dir = Path("checkpoints")
-    # checkpoint_dir.mkdir(exist_ok=True)
-
-    # best_val_accuracy = -1.0
-    # best_checkpoint_path = None
-
-    # if rank == 0:
-    #     print("Starting training...")
-    # for epoch in range(1, int(config.get('epochs', 10)) + 1):
-    #     if rank == 0:
-    #         print(f"\nEpoch {epoch}/{int(config.get('epochs', 10))}")
-
-    #     # If using DistributedSampler, set epoch for shuffling
-    #     if train_sampler is not None:
-    #         train_sampler.set_epoch(epoch)
-
-    #     train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, device)
-    #     val_loss, val_acc = validate(model, val_loader, device)
-
-    #     if rank == 0:
-    #         print(f"  Train loss: {train_loss:.4f}, Train acc: {train_acc:.4f}")
-    #         print(f"  Val loss:   {val_loss:.4f}, Val acc:   {val_acc:.4f}")
-
-    #         # Log to wandb (main process only)
-    #         if wandb_run is not None:
-    #             wandb.log({
-    #                 "epoch": epoch,
-    #                 "train/loss": train_loss,
-    #                 "train/accuracy": train_acc,
-    #                 "val/loss": val_loss,
-    #                 "val/accuracy": val_acc,
-    #             })
-
-    #     # Save best checkpoint
-    #     if rank == 0 and val_acc > best_val_accuracy:
-    #         best_val_accuracy = val_acc
-    #         best_checkpoint_path = checkpoint_dir / f"best_checkpoint_epoch{epoch}_acc{val_acc:.4f}.pth"
-    #         torch.save(
-    #             {
-    #                 "epoch": epoch,
-    #                 "model_state_dict": model.state_dict(),
-    #                 "optimizer_state_dict": optimizer.state_dict(),
-    #                 "val_accuracy": val_acc,
-    #             },
-    #             best_checkpoint_path,
-    #         )
-    #         print(f"  Saved best checkpoint: {best_checkpoint_path}")
-    #         if wandb_run is not None:
-    #             wandb.save(str(best_checkpoint_path))
-
-    # if best_checkpoint_path is None:
-    #     raise RuntimeError("No checkpoint was saved during training!")
-
-    # # Load best checkpoint and evaluate on test
-    # # Wait for all processes to finish training and checkpoint saving
-    # if world_size > 1 and dist.is_available() and dist.is_initialized():
-    #     dist.barrier()
-
-    # if rank == 0:
-    #     if best_checkpoint_path is None:
-    #         raise RuntimeError("No checkpoint was saved during training!")
-
-    #     print(f"\nLoading best checkpoint: {best_checkpoint_path}")
-    #     checkpoint = torch.load(best_checkpoint_path, map_location=device)
-    #     model.load_state_dict(checkpoint["model_state_dict"])
-
-    #     print("Evaluating on test set...")
-    #     test_preds, test_targets = evaluate_test(model, test_loader, device)
-
-    #     test_accuracy = accuracy_score(test_targets, test_preds)
-    #     # F1 score: use binary for 2 classes, macro otherwise
-    #     avg_type = "binary" if num_classes == 2 else "macro"
-    #     test_f1 = f1_score(test_targets, test_preds, average=avg_type)
-
-    #     print(f"\nTest Results:")
-    #     print(f"  Accuracy: {test_accuracy:.4f}")
-    #     print(f"  F1 Score ({avg_type}): {test_f1:.4f}")
-
-    #     # Log to wandb
-    #     if wandb_run is not None:
-    #         wandb.log({
-    #             "test/accuracy": test_accuracy,
-    #             "test/f1": test_f1,
-    #         })
-
-    #     print("\nTraining and evaluation complete!")
-    #     if wandb_run is not None:
-    #         wandb.finish()
-
-    # # Cleanup distributed process group
-    # if world_size > 1 and dist.is_available() and dist.is_initialized():
-    #     dist.destroy_process_group()
-
-
+  
 if __name__ == "__main__":
     main()
