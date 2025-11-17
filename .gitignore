@@ -8,3 +8,4 @@
 **ckpt/
 **checkpoints/
 **/*.sif
+**/*.out

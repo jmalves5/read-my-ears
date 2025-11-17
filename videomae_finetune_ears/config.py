@@ -9,7 +9,7 @@ from typing import Dict
 def default_wandb_config() -> Dict:
     """Default hyperparameters."""
     return {
-        "epochs": 10,
+        "epochs": 20,
         "batch_size": 4,
         "learning_rate": 1e-4,
         "num_frames": 16,
@@ -17,6 +17,9 @@ def default_wandb_config() -> Dict:
         "num_workers": 2,
         "seed": 42,
         "model_checkpoint": "MCG-NJU/videomae-base-finetuned-kinetics",
+        # Overfitting prevention parameters
+        "weight_decay": 0.01,  # L2 regularization
+        "early_stopping_patience": 3,  # Stop if val accuracy doesn't improve for 3 epochs
     }
 
 

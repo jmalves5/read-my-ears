@@ -4,15 +4,16 @@ From: ubuntu:22.04
 %post
     export DEBIAN_FRONTEND=noninteractive
     apt-get update && apt-get install -y \
-        python3 python3-pip libjpeg-dev zlib1g-dev git
+        python3 python3-pip libjpeg-dev zlib1g-dev git \
+        ffmpeg libavcodec-dev libavformat-dev libavutil-dev libswscale-dev
 
     python3 -m pip install --upgrade pip setuptools wheel
 
     # Core scientific stack
-    pip install numpy pandas scikit-learn matplotlib pillow requests wandb
+    pip install numpy pandas scikit-learn matplotlib pillow requests wandb seaborn
 
     # Install PyTorch first
-    pip install torch torchvision torchaudio decord
+    pip install torch torchvision torchaudio decord torchcodec av
 
     # Hugging Face ecosystem
     pip install evaluate
