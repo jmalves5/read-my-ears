@@ -1,8 +1,11 @@
-**wandb/*
+**wandb/
+**logs/
 **.pyc
 **plots
-**__pycache__/*
-**pycache/*
-**output/*
-**ckpt/*
-**checkpoints/*
+**__pycache__/
+**pycache/
+**output/
+**ckpt/
+**checkpoints/
+**/*.sif
+**/*.out
